@@ -38,7 +38,7 @@ class Guard:
             if self.db.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
                 raise PrivacyError("Privacy journal is corrupt; automatic deletion stopped")
             version = self.db.execute("PRAGMA user_version").fetchone()[0]
-            if version not in (0, 1):
+            if version not in (0, 1, 2):
                 raise PrivacyError("Unsupported privacy journal version")
             self.db.execute("PRAGMA synchronous=FULL")
             self.db.executescript("""
@@ -52,7 +52,13 @@ class Guard:
                 CREATE TABLE IF NOT EXISTS reservations (
                     id TEXT PRIMARY KEY, task TEXT NOT NULL, paths TEXT NOT NULL, uncertain INTEGER NOT NULL
                 );
-                PRAGMA user_version=1;
+                CREATE TABLE IF NOT EXISTS media (
+                    kind TEXT NOT NULL, path TEXT NOT NULL, file TEXT NOT NULL,
+                    version TEXT NOT NULL, size INTEGER NOT NULL, active INTEGER NOT NULL,
+                    PRIMARY KEY(kind, file)
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS media_current ON media(kind, path) WHERE active=1;
+                PRAGMA user_version=2;
             """)
             self.db.commit()
             if self.db.execute("PRAGMA foreign_key_check").fetchone() is not None:
@@ -250,63 +256,97 @@ class Guard:
     def update_file(self, row, document):
         self.change("UPDATE files SET document=? WHERE id=?", (json.dumps(document), row["id"]))
 
-    def artifact(self, relative):
-        path = contained(self.roots["output"], self.roots["output"] / relative)
+    def remember_media(self, kind, relative, encrypted, size):
+        version = identity(self.artifact(encrypted, kind))
+        if version is None:
+            raise PrivacyError("Ciphertext disappeared before its view mapping was committed")
+        with self.lock, self.db:
+            self.db.execute("UPDATE media SET active=0 WHERE kind=? AND path=?", (kind, relative))
+            self.db.execute("INSERT OR REPLACE INTO media VALUES (?,?,?,?,?,1)", (kind, relative, encrypted, json.dumps(version), size))
+
+    def mapped_media(self, kind, relative):
+        rows = self.rows("SELECT * FROM media WHERE kind=? AND path=? AND active=1", (kind, relative))
+        if not rows:
+            return None
+        row = rows[0]
+        path = self.artifact(row["file"], kind)
+        version = identity(path)
+        if version is None:
+            self.change("DELETE FROM media WHERE kind=? AND file=?", (kind, row["file"]))
+            return None
+        if version != json.loads(row["version"]):
+            raise PrivacyError("Mapped ciphertext was replaced or modified")
+        return path, row["size"]
+
+    def prune_media(self):
+        for row in self.rows("SELECT kind,file FROM media"):
+            if identity(self.artifact(row["file"], row["kind"])) is None:
+                self.change("DELETE FROM media WHERE kind=? AND file=?", (row["kind"], row["file"]))
+
+    def artifact(self, relative, kind="output"):
+        path = contained(self.roots[kind], self.roots[kind] / relative)
         if path is None:
-            raise PrivacyError("Encrypted artifact escaped output or became a link")
+            raise PrivacyError("Encrypted artifact escaped its directory or became a link")
         return path
 
-    def remove_partial(self, document):
+    def remove_partial(self, document, kind="output"):
         if document["partial"]:
-            path = self.artifact(document["partial"])
+            path = self.artifact(document["partial"], kind)
             if not path.name.startswith(".privacy-") or not path.name.endswith(".part"):
                 raise PrivacyError("Invalid partial artifact in privacy journal")
             version = identity(path)
             if version is not None:
-                remove_version(self.roots["output"], document["partial"], version)
+                remove_version(self.roots[kind], document["partial"], version)
 
     def encrypt(self, row, report):
+        kind = row["kind"]
+        root = self.roots[kind]
         document = json.loads(row["document"])
         version = json.loads(row["version"])
-        source = self.artifact(row["path"])
-        if document["destination"] and (self.artifact(document["destination"]).parent != source.parent or not document["destination"].endswith(".cpriv")):
+        source = self.artifact(row["path"], kind)
+        if document["destination"] and (self.artifact(document["destination"], kind).parent != source.parent or not document["destination"].endswith(".cpriv")):
             raise PrivacyError("Invalid ciphertext destination in privacy journal")
-        if document["partial"] and self.artifact(document["partial"]).parent != source.parent:
+        if document["partial"] and self.artifact(document["partial"], kind).parent != source.parent:
             raise PrivacyError("Invalid partial destination in privacy journal")
         if document["stage"] in ("verified", "published"):
-            destination = self.artifact(document["destination"])
-            partial = self.artifact(document["partial"])
+            destination = self.artifact(document["destination"], kind)
+            partial = self.artifact(document["partial"], kind)
             candidate = destination if destination.exists() else partial
             if candidate.exists() and crypto.file_digest(candidate) == document["digest"]:
                 with open(candidate, "rb") as encrypted:
                     crypto.read_header(encrypted)
                 if candidate == partial:
                     publish_file(partial, destination)
-                self.remove_partial(document)
-                remove_version(self.roots["output"], row["path"], version)
-                report["encrypted"].append({"source": row["path"], "file": document["destination"]})
+                self.remove_partial(document, kind)
+                self.remember_media(kind, row["path"], document["destination"], version[2])
+                removed = remove_version(root, row["path"], version)
+                if kind == "temp" and removed == "deleted":
+                    report["deleted_temp"] += 1
+                report["encrypted"].append({"type": kind, "source": row["path"], "file": document["destination"]})
+                return
+            if kind == "temp" and not source.exists() and not candidate.exists():
                 return
             if identity(source) == version:
                 document["stage"] = "pending"
             else:
                 raise PrivacyError("Verified ciphertext is missing or damaged; recovery stopped")
         if document["stage"] == "discard":
-            self.remove_partial(document)
-            remove_version(self.roots["output"], row["path"], version)
+            self.remove_partial(document, kind)
+            remove_version(root, row["path"], version)
             report["lost_outputs"].append(row["path"])
             report["errors"].append(f"Recovered a failed encryption; plaintext discarded: {row['path']}")
             return
         if identity(source) != version:
-            self.remove_partial(document)
-            report["replaced"].append("output/" + row["path"])
+            self.remove_partial(document, kind)
+            report["replaced"].append(kind + "/" + row["path"])
             return
         try:
-            self.remove_partial(document)
+            self.remove_partial(document, kind)
             destination = source.with_suffix(".cpriv")
             if destination.exists():
                 destination = source.with_name(source.stem + "." + uuid.uuid4().hex + ".cpriv")
             partial = source.with_name(".privacy-" + uuid.uuid4().hex + ".part")
-            document.update(stage="writing", destination=destination.relative_to(self.roots["output"]).as_posix(), partial=partial.relative_to(self.roots["output"]).as_posix(), digest=None)
+            document.update(stage="writing", destination=destination.relative_to(root).as_posix(), partial=partial.relative_to(root).as_posix(), digest=None)
             self.update_file(row, document)
             with open(source, "rb") as plain, open(partial, "xb") as encrypted:
                 plain_digest = crypto.encrypt_stream(plain, encrypted, filename=source.name)
@@ -315,8 +355,8 @@ class Guard:
             if verified != plain_digest:
                 raise PrivacyError("Encrypted file verification failed")
             if identity(source) != version:
-                self.remove_partial(document)
-                report["replaced"].append("output/" + row["path"])
+                self.remove_partial(document, kind)
+                report["replaced"].append(kind + "/" + row["path"])
                 return
             document.update(stage="verified", digest=crypto.file_digest(partial))
             self.update_file(row, document)
@@ -327,13 +367,16 @@ class Guard:
             # The configured policy deliberately sacrifices an output on encryption failure.
             document["stage"] = "discard"
             self.update_file(row, document)
-            remove_version(self.roots["output"], row["path"], version)
-            self.remove_partial(document)
+            remove_version(root, row["path"], version)
+            self.remove_partial(document, kind)
             report["lost_outputs"].append(row["path"])
             report["errors"].append(f"Encryption failed; plaintext discarded: {row['path']} ({type(error).__name__})")
             return
-        remove_version(self.roots["output"], row["path"], version)
-        report["encrypted"].append({"source": row["path"], "file": document["destination"]})
+        self.remember_media(kind, row["path"], document["destination"], version[2])
+        removed = remove_version(root, row["path"], version)
+        if kind == "temp" and removed == "deleted":
+            report["deleted_temp"] += 1
+        report["encrypted"].append({"type": kind, "source": row["path"], "file": document["destination"]})
 
     def cleanup(self, task_id):
         with self.processing_lock:
@@ -358,7 +401,7 @@ class Guard:
                             report["deleted_input"] += 1
                         elif result == "replaced":
                             report["replaced"].append("input/" + row["path"])
-                elif row["kind"] == "temp":
+                elif row["kind"] == "temp" and not is_media(row["path"]):
                     result = remove_version(self.roots["temp"], row["path"], json.loads(row["version"]))
                     if result == "deleted":
                         report["deleted_temp"] += 1
@@ -406,16 +449,17 @@ class Guard:
         return [result for result in results if result is not None]
 
     def recover(self):
-        for row in self.rows("SELECT document FROM files WHERE kind='output'"):
-            document = json.loads(row[0])
+        for row in self.rows("SELECT kind,document FROM files WHERE kind!='input'"):
+            document = json.loads(row["document"])
             for name in (document["partial"], document["destination"]):
                 if not name:
                     continue
-                path = self.artifact(name)
+                path = self.artifact(name, row["kind"])
                 if path.exists():
                     with open(path, "rb") as stream:
                         if stream.read(len(crypto.LEGACY_MAGIC)) == crypto.LEGACY_MAGIC:
                             raise crypto.LegacyFormatError("Unfinished PrivacyGuard v1 output: use the original v1 tool before upgrading")
+        self.prune_media()
         self.change("DELETE FROM reservations")
         for row in self.rows("SELECT id,document FROM tasks"):
             task = json.loads(row["document"])

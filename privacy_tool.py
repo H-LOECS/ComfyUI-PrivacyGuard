@@ -6,37 +6,10 @@ from pathlib import Path
 
 if __package__:
     from .crypto import decrypt_stream_with_filename
-    from .paths import contained, publish_file, snapshot
+    from .paths import contained, media_suffix, publish_file, snapshot
 else:
     from crypto import decrypt_stream_with_filename
-    from paths import contained, publish_file, snapshot
-
-
-def media_suffix(data):
-    for signature, suffix in (
-        (b"\x89PNG\r\n\x1a\n", ".png"), (b"\xff\xd8\xff", ".jpg"),
-        (b"GIF87a", ".gif"), (b"GIF89a", ".gif"), (b"BM", ".bmp"),
-        (b"II*\x00", ".tif"), (b"MM\x00*", ".tif"),
-        (b"FLV", ".flv"), (b"\x76\x2f\x31\x01", ".exr"),
-        (b"#?RADIANCE", ".hdr"), (b"\x00\x00\x01\x00", ".ico"),
-    ):
-        if data.startswith(signature):
-            return suffix
-    if data[:4] == b"RIFF":
-        return {b"WEBP": ".webp", b"AVI ": ".avi"}.get(data[8:12])
-    if data[4:8] == b"ftyp":
-        box_size = int.from_bytes(data[:4], "big")
-        brands = {data[8:12]} | {data[i:i + 4] for i in range(16, min(box_size, len(data)), 4)}
-        if brands & {b"avif", b"avis"}:
-            return ".avif"
-        if brands & {b"heic", b"heix", b"hevc", b"hevx"}:
-            return ".heic"
-        if brands & {b"mif1", b"msf1"}:
-            return ".heif"
-        return ".mov" if b"qt  " in brands else ".mp4"
-    if data.startswith(b"\x1a\x45\xdf\xa3"):
-        return ".webm" if b"webm" in data else ".mkv"
-    return None
+    from paths import contained, media_suffix, publish_file, snapshot
 
 
 def restored_filename(source, temporary, filename):

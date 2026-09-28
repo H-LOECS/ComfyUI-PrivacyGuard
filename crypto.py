@@ -92,6 +92,41 @@ def decrypt_stream(source, destination=None):
 
 def decrypt_stream_with_filename(source, destination=None):
     """Return the content digest and original filename after verifying the entire file."""
+    reader = StreamReader(source)
+    digest = hashlib.sha256()
+    for plain in reader:
+        digest.update(plain)
+        if destination is not None:
+            destination.write(plain)
+    return digest.hexdigest(), reader.filename
+
+
+class StreamReader:
+    """Sequential reader; authentication is complete only after exhausting the iterator."""
+
+    def __init__(self, source):
+        self.source = source
+        self.finished = False
+        self.state, self.authenticated_header, self.filename = _start_reader(source)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self.finished:
+            raise StopIteration
+        plain, tag = _read_record(self.source, self.state, self.authenticated_header, CHUNK_SIZE)
+        if tag == TAG_FINAL:
+            if plain or self.source.read(1):
+                raise ValueError("Invalid final block or trailing content")
+            self.finished = True
+            raise StopIteration
+        if tag != TAG_MESSAGE or not plain:
+            raise ValueError("Invalid data block")
+        return plain
+
+
+def _start_reader(source):
     header, authenticated_header, stream_header = read_header(source)
     state = sodium.crypto_secretstream_xchacha20poly1305_state()
     sodium.crypto_secretstream_xchacha20poly1305_init_pull(state, stream_header, derive_key(header["timestamp_ns"]))
@@ -106,18 +141,7 @@ def decrypt_stream_with_filename(source, destination=None):
         filename = metadata["filename"]
         if filename is not None and (not isinstance(filename, str) or not filename):
             raise ValueError("Invalid original filename")
-    digest = hashlib.sha256()
-    while True:
-        plain, tag = _read_record(source, state, authenticated_header, CHUNK_SIZE)
-        if tag == TAG_FINAL:
-            if plain or source.read(1):
-                raise ValueError("Invalid final block or trailing content")
-            return digest.hexdigest(), filename
-        if tag != TAG_MESSAGE or not plain:
-            raise ValueError("Invalid data block")
-        digest.update(plain)
-        if destination is not None:
-            destination.write(plain)
+    return state, authenticated_header, filename
 
 
 def encrypt_stream(source, destination, filename=None):

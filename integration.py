@@ -19,6 +19,7 @@ from .paths import contained, is_image, snapshot
 
 try:
     from .guard import Guard
+    from .view import ViewService, resolve_request
     DEPENDENCY_ERROR = None
 except ImportError as error:
     Guard = None
@@ -30,6 +31,7 @@ class Integration:
         self.server = server
         self.queue = server.prompt_queue
         self.guard = None
+        self.views = None
         self.error = None
         self.enabled = True
         self.active_group = None
@@ -56,6 +58,7 @@ class Integration:
         self.guard = Guard(roots, Path(folder_paths.get_user_directory()) / "privacyguard")
         for report in self.guard.recover():
             self.publish(report)
+        self.views = ViewService(self.guard)
         logging.info("PrivacyGuard ready; time-derived encryption")
 
     def ready(self):
@@ -436,6 +439,10 @@ class Integration:
 
         @web.middleware
         async def privacy_ready(request, handler):
+            if request.method in ("GET", "HEAD") and request.path.rstrip("/") in ("/view", "/api/view") and self.views is not None:
+                target = resolve_request(request.query, self.guard.roots)
+                if target is not None:
+                    return await self.views.handle(request, *target)
             if request.method == "POST" and request.path.rstrip("/") in ("/prompt", "/api/prompt"):
                 try:
                     self.ready()
