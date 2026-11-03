@@ -1,5 +1,6 @@
 import contextvars
 from contextlib import contextmanager
+import errno
 import functools
 import logging
 import os
@@ -93,10 +94,17 @@ class Integration:
         root = self.guard.roots["input"]
         path_fields = {"image", "mask", "file", "filename", "directory", "folder", "path", "image_path", "video", "source"}
         for node in prompt.values():
+            node_class = nodes.NODE_CLASS_MAPPINGS.get(node.get("class_type"))
+            schema = node_class.INPUT_TYPES() if node_class is not None else {}
+            definitions = {**schema.get("required", {}), **schema.get("optional", {})}
             for name, value in node.get("inputs", {}).items():
                 if isinstance(value, list) and len(value) == 2 and name in path_fields:
                     uncertain = True
-                if not isinstance(value, str) or not value:
+                if not isinstance(value, str) or not value or "\x00" in value:
+                    continue
+                definition = definitions.get(name, ())
+                options = definition[1] if len(definition) > 1 else {}
+                if definition and definition[0] == "STRING" and options.get("multiline") and name not in path_fields:
                     continue
                 filename, annotation = folder_paths.annotated_filepath(value)
                 if annotation is not None and Path(annotation).resolve() != root:
@@ -105,12 +113,19 @@ class Integration:
                 if not Path(filename).is_absolute():
                     candidates.append(Path(os.path.abspath(filename)))
                 for candidate in candidates:
-                    candidate = contained(root, candidate)
+                    try:
+                        candidate = contained(root, candidate)
+                        is_file = candidate is not None and candidate.is_file()
+                        is_directory = candidate is not None and candidate.is_dir()
+                    except OSError as error:
+                        if error.errno == errno.ENAMETOOLONG or getattr(error, "winerror", None) == 206:
+                            continue
+                        raise
                     if candidate is None:
                         continue
-                    if candidate.is_file() and is_image(candidate):
+                    if is_file and is_image(candidate):
                         paths.add(candidate.relative_to(root).as_posix())
-                    elif candidate.is_dir():
+                    elif is_directory:
                         files, _ = snapshot(candidate)
                         for relative in files:
                             if is_image(relative):
